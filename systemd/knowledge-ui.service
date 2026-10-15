@@ -1,0 +1,16 @@
+[Unit]
+Description=Knowledge LXC - Mini Status-UI (:8080)
+After=network-online.target knowledge-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=knowledge
+Group=knowledge
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/knowledge/knowledge-ui.py --port 8080 --mcp-port 8000 --data-dir /var/lib/knowledge --bm-bin /usr/local/bin/basic-memory --bind 0.0.0.0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

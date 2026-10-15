@@ -8,11 +8,11 @@
 # Laeuft:   vollstaendig lokal im LXC, keine Cloud noetig
 # Host:     DAS SKRIPT LAEUFT AUF DEM PROXMOX-HOST (nicht im Container!)
 # Usage:
-#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/knowledge-proxmox/main/install/knowledge.sh)"
-#   CT_ID=150 CORES=2 RAM=4096 DISK=10 bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/knowledge-proxmox/main/install/knowledge.sh)"
+#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/BasicAI-WissensDatenbank/main/install/knowledge.sh)"
+#   CT_ID=150 CORES=2 RAM=4096 DISK=10 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/BasicAI-WissensDatenbank/main/install/knowledge.sh)"
 #   bash knowledge.sh --ctid 150 --cores 2 --memory 4096 --disk 10 --bridge vmbr0 --debug
 #
-# HINWEIS: USER oben im Einzeiler ersetzen (z. B. HatchetMan111/Knowledge-Proxmox).
+# Repo: https://github.com/HatchetMan111/BasicAI-WissensDatenbank
 # basic-memory braucht fuer Embeddings RAM: Default 4096 MB, Minimum 2048 MB.
 #
 set -euo pipefail
@@ -24,7 +24,7 @@ APP="knowledge"                               # Container-Hostname + Service-Pre
 MCP_PORT="8000"                               # basic-memory MCP SSE
 UI_PORT="8080"                                # Mini Status-UI
 UPSTREAM_REPO="https://github.com/basicmachines-co/basic-memory"
-INSTALLER_REPO="https://github.com/USER/knowledge-proxmox"
+INSTALLER_REPO="https://github.com/HatchetMan111/BasicAI-WissensDatenbank"
 MCP_SERVICE_URL="${INSTALLER_REPO%/}/raw/main/systemd/knowledge-mcp.service"
 UI_SERVICE_URL="${INSTALLER_REPO%/}/raw/main/systemd/knowledge-ui.service"
 UI_PY_URL="${INSTALLER_REPO%/}/raw/main/src/knowledge-ui.py"

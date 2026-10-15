@@ -10,16 +10,14 @@ Läuft vollständig lokal im LXC, keine Cloud nötig.
 
 ## Installation (Einzeiler, auf dem Proxmox-Host als root)
 
-> `USER` ersetzen!
-
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/knowledge-proxmox/main/install/knowledge.sh)"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/BasicAI-WissensDatenbank/main/install/knowledge.sh)"
 ```
 
 Mit Parametern:
 
 ```bash
-CT_ID=150 CORES=2 RAM=4096 DISK=10 bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/knowledge-proxmox/main/install/knowledge.sh)"
+CT_ID=150 CORES=2 RAM=4096 DISK=10 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/BasicAI-WissensDatenbank/main/install/knowledge.sh)"
 # oder:
 bash knowledge.sh --ctid 150 --cores 2 --memory 4096 --disk 10 --bridge vmbr0 --debug
 ```
@@ -48,7 +46,7 @@ Danach: `"Lege eine Notiz zu X an."`, `"Suche in meinen Notes nach Y."`
 
 ```bash
 # Update: Script erneut laufen lassen (idempotent)
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/knowledge-proxmox/main/install/knowledge.sh)"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/BasicAI-WissensDatenbank/main/install/knowledge.sh)"
 
 # im Container: basic-memory Version
 pct enter <CTID>

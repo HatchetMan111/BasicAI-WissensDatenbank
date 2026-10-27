@@ -71,18 +71,141 @@ Wichtig: `uv tool upgrade basic-memory` setzt die Pins/`fastembed`-Entfernung
 zurück. Danach Installer erneut ausführen (idempotent) oder die
 Provider-Konfiguration oben nutzen.
 
-## Agenten anbinden
+## Agenten anbinden (MCP)
 
-OpenCode (`~/.config/opencode/opencode.json`, Bereich `mcp`):
+Die Installation liefert **einen** MCP-Server für alle Agenten. Beide Endpoints
+zeigen auf denselben Graphen (Projekt `main` → `/var/lib/knowledge`):
+
+| Transport | URL | Status |
+| --- | --- | --- |
+| SSE | `http://<LXC-IP>:8000/sse` | Default dieser Installation |
+| Streamable HTTP | `http://<LXC-IP>:8000/mcp` | nach Umstellung (siehe unten) |
+
+Umstellung auf Streamable HTTP (upstream-Empfehlung, manche Clients wollen das):
+
+```bash
+pct exec <CTID> -- sed -i 's/--transport sse/--transport streamable-http/' /etc/systemd/system/knowledge-mcp.service
+pct exec <CTID> -- systemctl daemon-reload
+pct exec <CTID> -- systemctl restart knowledge-mcp
+# danach: http://<LXC-IP>:8000/mcp
+```
+
+Nur ein Transport gleichzeitig (ein Prozess = ein Watcher auf der DB).
+
+### OpenCode
+
+`~/.config/opencode/opencode.json` (global) oder `opencode.json` im Projekt,
+Eintrag in das bestehende `mcp`-Objekt mergen:
 
 ```json
-"knowledge": {
-  "type": "remote",
-  "url": "http://192.168.1.xx:8000/sse"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "knowledge": {
+      "type": "remote",
+      "url": "http://10.120.1.194:8000/sse",
+      "enabled": true
+    }
+  }
 }
 ```
 
-Danach: `"Lege eine Notiz zu X an."`, `"Suche in meinen Notes nach Y."`
+Prüfen: `opencode mcp list`, debuggen: `opencode mcp debug knowledge`.
+Die Tools heißen mit Server-Prefix `knowledge_*` (z. B. `knowledge_write_note`).
+
+### Claude Code
+
+```bash
+# alle Projekte (user scope)
+claude mcp add --transport sse --scope user knowledge http://10.120.1.194:8000/sse
+
+# alternativ Streamable HTTP
+claude mcp add --transport http --scope user knowledge http://10.120.1.194:8000/mcp
+```
+
+Prüfen: `claude mcp list` → `knowledge: ... - ✓ Connected`.
+
+### Claude Desktop
+
+Desktop spricht lokale HTTP-Endpoints nicht direkt, dafür den Brücken-Prozess
+`mcp-remote` nutzen — `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "knowledge": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://10.120.1.194:8000/sse"]
+    }
+  }
+}
+```
+
+Datei liegt auf macOS unter
+`~/Library/Application Support/Claude/claude_desktop_config.json`, unter Windows
+unter `%APPDATA%\Claude\claude_desktop_config.json`. Danach Claude Desktop
+komplett beenden (Tray) und neu starten.
+
+Alternativ (nur mit HTTPS): Settings → Connectors → „Add custom connector“ mit
+`https://…/sse` (z. B. über Tailscale Funnel, siehe ChatGPT).
+
+### ChatGPT
+
+ChatGPT verbindet **nur remote** und braucht einen **öffentlichen HTTPS**-Endpoint
+(oder „Secure MCP Tunnel“). Pro/Plus/Business/Enterprise/Edu, Web-UI.
+
+```bash
+# Beispiel Tailscale (LXC-Host im Tailnet): HTTPS-Endpoint auf 443 -> 8000
+tailscale funnel --bg 8000
+# URL: https://<host>.<tailnet>.ts.net/sse
+```
+
+Dann auf <https://chatgpt.com/plugins> → „+“ → „Add custom MCP server“ →
+URL eintragen → Authentifizierung „No authentication“ → „Scan tools“.
+ChatGPT nutzt zusätzlich die OpenAI-spezifischen `search`/`fetch`-Tools, die
+basic-memory mitbringt.
+
+> **Achtung:** Der Endpoint hat **keine Authentifizierung**. Wer die URL kennt,
+> kann Notizen lesen *und* schreiben. Nur im LAN/VPN oder hinter einem
+> tokenprüfenden Reverse Proxy (Caddy/nginx) veröffentlichen.
+
+### Was der Agent kann (Tools)
+
+`write_note`, `read_note`, `edit_note`, `move_note`, `delete_note`,
+`search_notes`, `recent_activity`, `build_context`, `list_directory`,
+`view_note`, `bm_find` sowie `search`/`fetch` für ChatGPT.
+
+Suchtypen: `text` (Keyword/FTS) und `hybrid`/`semantic` — bei `SEMANTIC=off`
+(siehe oben) liefert alles Keyword-Treffer.
+
+### Beispiel-Prompts
+
+```text
+Schreib in knowledge eine Notiz "Proxmox-Backup" mit den Schritten, die wir gerade gemacht haben.
+Suche in knowledge nach "ZFS snapshot" und fasse zusammen, was dort steht.
+Hole mit build_context alles zu "Homelab Netzwerk" und beantworte meine Frage daraus.
+Was war die letzte Aktivität in knowledge?
+```
+
+Ohne expliziten Hinweis nutzen Agenten die Tools oft nicht — „nutze knowledge“
+oder eine `AGENTS.md`/`CLAUDE.md`-Regel hilft:
+
+```md
+Wenn es um Notizen, Wissen oder frühere Entscheidungen geht: nutze die knowledge-MCP-Tools.
+```
+
+### Notizen direkt schreiben/lesen
+
+```bash
+pct enter <CTID>
+basic-memory project list          # Projekt main -> /var/lib/knowledge
+basic-memory search "backup"       # Keyword-Suche
+basic-memory sync                  # Dateien aus /var/lib/knowledge indexieren
+```
+
+Alles unter `/var/lib/knowledge/*.md` (Markdown + Frontmatter, Obsidian-kompatibel)
+wird bei laufendem Dienst automatisch indexiert (`BASIC_MEMORY_SYNC_CHANGES=true`).
+Die Web-UI auf `:8080` ist reine Statusanzeige.
 
 ## Update / Deinstall / Reboot-Test
 

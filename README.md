@@ -29,25 +29,30 @@ Das Script ist idempotent (`set -euo pipefail`, volle Fehlerkette ins Log,
 `--debug` für `bash -x`): existiert die CT-ID, läuft es im Update-Modus
 (`uv tool upgrade`, Units neu, Services restart).
 
-## Semantische Suche und CPU-Anforderung (AVX)
+## Native Wheels, alte CPUs und SIGILL
 
-basic-memory sucht standardmäßig semantisch: `fastembed` + `onnxruntime` laden
-lokal das Embedding-Modell `bge-small-en-v1.5` (384 Dimensionen). Die
-`onnxruntime`-Wheels setzen **AVX** voraus.
+basic-memory nutzt native Wheels (`pydantic-core`, `numpy`, `sqlite-vec`, …) und
+für Embeddings `fastembed`/`onnxruntime`. Auf älteren CPUs (kein AVX oder
+neuere SIMD-Baseline) kann eines dieser Module den Prozess hart mit `SIGILL`
+beenden — Symptom: `systemd: status=4/ILL` oder `Illegal instruction` bei
+`basic-memory project list`.
 
-Der Installer prüft `/proc/cpuinfo`:
+Der Installer rät nicht, sondern misst:
 
-| CPU | Ergebnis |
-| --- | --- |
-| AVX vorhanden | semantische Suche aktiv (lokale Embeddings) |
-| kein AVX (Atom/Celeron u.a.) | `fastembed`/`onnxruntime` werden entfernt → **Keyword-/FTS-Suche** |
+1. **AVX-Check** (`/proc/cpuinfo`). Ohne AVX werden `fastembed`/`onnxruntime`
+   entfernt → Keyword-/FTS-Suche (`/etc/knowledge-semantic.conf`, `SEMANTIC=off`).
+2. **Self-Test** `basic-memory project list` direkt nach der Installation.
+3. **Bei Crash**: Modul-Sweep (jedes Modul in eigenem Prozess) + `dmesg`, dann
+   automatische Pins, nach jedem Schritt erneut getestet:
+   `numpy==1.26.4` → `sqlite-vec==0.1.9` → `basic-memory==0.23.2`.
+   Der erfolgreiche Fix landet in `/etc/knowledge-runtime.conf` (`RUNTIME=…`)
+   und in der Abschluss-Zusammenfassung.
+4. **Hilft nichts**: Abbruch mit vollem Sweep, Journal und Kernel-Trap
+   (nennt die crashende `.so`) — kein stiller Fehlschlag.
 
-Ohne AVX würde `import onnxruntime` den MCP-Prozess mit `SIGILL` beenden
-(systemd: `status=4/ILL`, ~20 s nach Start). Der Installer startet den Dienst
-und prüft 30 s lang auf Stabilität (`NRestarts == 0`); schlägt das fehl, wird
-`fastembed` automatisch entfernt, neu gestartet und die Ursache im Journal
-ausgegeben. Der aktive Modus steht in `/etc/knowledge-semantic.conf`
-(`SEMANTIC=on|off`) und wird in der Web-UI angezeigt.
+Anschließend startet der Installer `knowledge-mcp` und prüft 30 s auf
+Stabilität (`NRestarts == 0`); schlägt das fehl, wird `fastembed` entfernt,
+neu gestartet und die Ursache ausgegeben.
 
 Semantische Suche **ohne** AVX nachrüsten (OpenAI-kompatibler
 Embedding-Server, z. B. Ollama auf einem anderen Host):
@@ -62,9 +67,9 @@ basic-memory reindex --embeddings
 systemctl restart knowledge-mcp
 ```
 
-Wichtig: `uv tool upgrade basic-memory` installiert `fastembed` auf einem
-Nicht-AVX-Host wieder mit. Danach den Installer erneut ausführen (entfernt es
-wieder) oder die Provider-Konfiguration oben nutzen.
+Wichtig: `uv tool upgrade basic-memory` setzt die Pins/`fastembed`-Entfernung
+zurück. Danach Installer erneut ausführen (idempotent) oder die
+Provider-Konfiguration oben nutzen.
 
 ## Agenten anbinden
 
@@ -112,8 +117,11 @@ systemd/knowledge-ui.service  UI-Service (:8080)
 pct exec <CTID> -- systemctl status knowledge-mcp --no-pager
 pct exec <CTID> -- journalctl -u knowledge-mcp --no-pager -n 200
 
-# Modus der semantischen Suche
-pct exec <CTID> -- cat /etc/knowledge-semantic.conf
+# Modus der semantischen Suche + aktiver Runtime-Fix
+pct exec <CTID> -- cat /etc/knowledge-semantic.conf /etc/knowledge-runtime.conf
+
+# Self-Test / Diagnose der nativen Module
+pct exec <CTID> -- su - knowledge -c 'cd /home/knowledge && basic-memory project list' 
 
 # CPU-Flags im Container
 pct exec <CTID> -- grep -m1 '^flags' /proc/cpuinfo

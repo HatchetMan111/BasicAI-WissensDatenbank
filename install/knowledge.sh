@@ -219,6 +219,107 @@ push_file() {
   rm -f "$tmp"
 }
 
+# ---------------------------------------------------------------------------
+# Self-Test + SIGILL-Mitigation (native Wheels vs. alte CPUs)
+# ---------------------------------------------------------------------------
+BM_VENV_PY="/home/knowledge/.local/share/uv/tools/basic-memory/bin/python"
+
+bm_uv() {  # bm_uv install <spec> ...  (in das uv-tool-venv)
+  pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv pip $* --python $BM_VENV_PY"
+}
+
+strip_fastembed() {
+  pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv pip uninstall --python $BM_VENV_PY fastembed onnxruntime onnxruntime-extensions" || true
+  pct exec "$CT_ID" -- rm -rf /var/lib/knowledge/fastembed_cache /home/knowledge/.cache/fastembed || true
+}
+
+bm_selftest() {  # 0 = basic-memory laeuft, sonst Exit-Code (132 = SIGILL)
+  local rc=0
+  pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && /usr/local/bin/basic-memory project list" >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+
+diag_native_modules() {  # pro Modul ein eigener Prozess, damit ein Crash den Sweep nicht stoppt
+  local mod rc
+  push_file /tmp/knowledge-import.py <<'PYEOF'
+import sys
+
+__import__(sys.argv[1])
+PYEOF
+  push_file /tmp/knowledge-vecload.py <<'PYEOF'
+import sqlite3
+
+import sqlite_vec
+
+conn = sqlite3.connect(":memory:")
+conn.enable_load_extension(True)
+conn.load_extension(sqlite_vec.loadable_path())
+conn.execute("select vec_version()").fetchone()
+PYEOF
+  for mod in pydantic_core sqlalchemy numpy sqlite_vec tiktoken tokenizers mmh3 jsonschema fastmcp mcp basic_memory basic_memory.db basic_memory.repository.search_repository; do
+    rc=0
+    pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && $BM_VENV_PY /tmp/knowledge-import.py $mod" >/dev/null 2>&1 || rc=$?
+    if [[ "$rc" == "0" ]]; then echo "OK     $mod"; else echo "CRASH  $mod (rc=$rc)"; fi
+  done
+  rc=0
+  pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && $BM_VENV_PY /tmp/knowledge-vecload.py" >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" == "0" ]]; then echo "OK     sqlite-vec load_extension"; else echo "CRASH  sqlite-vec load_extension (rc=$rc)"; fi
+}
+
+diag_dump() {
+  msg_error "Native Modul-Sweep (CRASH = Prozess wurde abgebrochen):"
+  diag_native_modules 2>&1 | sed 's/^/    /' || true
+  msg_error "Kernel-Trap (nennt die crashende Shared Library):"
+  dmesg 2>/dev/null | tail -n 15 || true
+}
+
+mitigate_runtime() {  # versucht bekannte Pins und prueft nach jedem Schritt neu
+  local out crashers rc strat
+  local -a strats
+
+  rc="$(bm_selftest)"
+  if [[ "$rc" == "0" ]]; then msg_ok "Self-Test 'basic-memory project list' OK."; return 0; fi
+  msg_warn "Self-Test fehlgeschlagen (rc=$rc) – basic-memory crasht auf dieser CPU."
+
+  out="$(diag_native_modules 2>&1 || true)"
+  printf '%s\n' "$out" | sed 's/^/    /'
+  crashers="$(printf '%s\n' "$out" | awk '/^CRASH/ {print $2}' | tr '\n' ' ')"
+  msg_warn "Crash-Module: ${crashers:-unbekannt}"
+
+  case " $crashers " in
+    *" sqlite_vec "* | *" sqlite-vec "*) strats=("sqlitevec" "numpy" "older") ;;
+    *" numpy "*)      strats=("numpy" "sqlitevec" "older") ;;
+    *)                strats=("numpy" "sqlitevec" "older") ;;
+  esac
+
+  for strat in "${strats[@]}"; do
+    case "$strat" in
+      numpy)
+        msg_info "Strategie 1: numpy==1.26.4 (2.x-Wheels nutzen neuere SIMD-Pfade) ..."
+        bm_uv install numpy==1.26.4 || true
+        ;;
+      sqlitevec)
+        msg_info "Strategie 2: sqlite-vec==0.1.9 (Extension statt Alpha-Wheel) ..."
+        bm_uv install sqlite-vec==0.1.9 || true
+        ;;
+      older)
+        msg_info "Strategie 3: basic-memory==0.23.2 (aelterer Wheel-Stack) ..."
+        pct exec "$CT_ID" -- su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv tool install basic-memory==0.23.2 --force" || true
+        pct exec "$CT_ID" -- ln -sf /home/knowledge/.local/bin/basic-memory /usr/local/bin/basic-memory || true
+        if [[ "$SEMANTIC_MODE" == "off" ]]; then strip_fastembed; fi
+        ;;
+    esac
+    rc="$(bm_selftest)"
+    if [[ "$rc" == "0" ]]; then
+      msg_ok "Self-Test OK nach Strategie '$strat'."
+      pct exec "$CT_ID" -- bash -c "printf 'RUNTIME=%s\n' '$strat' > /etc/knowledge-runtime.conf" || true
+      return 0
+    fi
+    msg_warn "Strategie '$strat' half nicht (rc=$rc)."
+  done
+  return 1
+}
+
 msg_info "Installiere basic-memory nativ via uv (idempotent) ..."
 pct exec "$CT_ID" -- bash -c '
   set -euo pipefail
@@ -231,7 +332,7 @@ pct exec "$CT_ID" -- bash -c '
   if [ ! -x /home/knowledge/.local/bin/uv ]; then
     su - knowledge -c "cd /home/knowledge && curl -LsSf https://astral.sh/uv/install.sh | sh"
   fi
-  su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv tool install basic-memory --prerelease=allow"
+  su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv tool install basic-memory"
   ln -sf /home/knowledge/.local/bin/basic-memory /usr/local/bin/basic-memory
   /usr/local/bin/basic-memory --version
   # onnxruntime-Wheels setzen AVX voraus. Fehlt AVX, killt "import fastembed" den
@@ -257,6 +358,13 @@ if [[ "$SEMANTIC_MODE" == "off" ]]; then
   msg_warn "  und semantic_embedding_provider=litellm + semantic_embedding_api_base setzen."
 else
   msg_ok "AVX vorhanden: semantische Suche (fastembed, lokale Embeddings) aktiv."
+fi
+
+msg_info "Self-Test basic-memory (project list) ..."
+if ! mitigate_runtime; then
+  msg_error "basic-memory laeuft auf dieser CPU nicht stabil – vollstaendige Diagnose:"
+  diag_dump
+  exit 1
 fi
 
 msg_info "Lege Mini-UI nach /opt/knowledge ..."
@@ -401,6 +509,7 @@ if ! pct exec "$CT_ID" -- bash -c '
   fi
 '; then
   msg_error "Projekt-Init fehlgeschlagen (vollstaendige Ausgabe oben)."
+  diag_dump
   exit 1
 fi
 msg_ok "Projekt main -> /var/lib/knowledge bereit."
@@ -432,11 +541,8 @@ if ! wait_mcp_stable; then
   pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 120 || true
   if [[ "$SEMANTIC_MODE" == "on" ]]; then
     msg_warn "Fallback: entferne fastembed/onnxruntime (semantische Suche aus) und starte neu ..."
-    pct exec "$CT_ID" -- bash -c '
-      su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv pip uninstall --python /home/knowledge/.local/share/uv/tools/basic-memory/bin/python fastembed onnxruntime onnxruntime-extensions" || true
-      printf "SEMANTIC=off\n" > /etc/knowledge-semantic.conf
-      rm -rf /var/lib/knowledge/fastembed_cache /home/knowledge/.cache/fastembed
-    ' || true
+    strip_fastembed
+    pct exec "$CT_ID" -- bash -c "printf 'SEMANTIC=off\n' > /etc/knowledge-semantic.conf" || true
     SEMANTIC_MODE=off
     pct exec "$CT_ID" -- systemctl reset-failed knowledge-mcp 2>/dev/null || true
     pct exec "$CT_ID" -- systemctl restart knowledge-mcp 2>/dev/null || pct exec "$CT_ID" -- systemctl start knowledge-mcp
@@ -447,9 +553,11 @@ if ! wait_mcp_stable; then
       msg_error "MCP startet auch ohne fastembed nicht. Vollstaendiges Journal:"
       pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 200 || true
       pct exec "$CT_ID" -- systemctl status knowledge-mcp --no-pager || true
+      diag_dump
       exit 1
     fi
   else
+    diag_dump
     exit 1
   fi
 fi
@@ -488,6 +596,12 @@ echo "  Ressourcen   : $CORES vCPU / $RAM MB RAM / $DISK GB Disk"
 echo "  Web UI       : http://${CT_IP}:${UI_PORT}  (/health)"
 echo "  MCP-SSE      : http://${CT_IP}:${MCP_PORT}/sse  (fuer alle Agenten als remote MCP)"
 echo "  Daten        : /var/lib/knowledge (*.md, Obsidian-kompatibel)"
+SEM_SUMMARY="$(pct exec "$CT_ID" -- sed -n 's/^SEMANTIC=//p' /etc/knowledge-semantic.conf 2>/dev/null | tr -d '\r' || true)"
+RT_SUMMARY="$(pct exec "$CT_ID" -- sed -n 's/^RUNTIME=//p' /etc/knowledge-runtime.conf 2>/dev/null | tr -d '\r' || true)"
+case "${SEM_SUMMARY:-on}" in
+  off) echo "  Semantik     : AUS – Keyword-/FTS-Suche (CPU ohne AVX, fastembed entfernt)" ;;
+  *)   echo "  Semantik     : AN – lokale Embeddings (fastembed)${RT_SUMMARY:+ | Runtime-Fix: $RT_SUMMARY}" ;;
+esac
 echo "  Root-Passwort: ${PASSWORD_ARG:-<bestehender CT, unveraendert>} (nur jetzt angezeigt!)"
 echo "  Service      : systemctl status knowledge-mcp knowledge-ui  (im Container via: pct enter $CT_ID)"
 echo "  Update       : Skript erneut laufen lassen (idempotent, uv tool upgrade)"

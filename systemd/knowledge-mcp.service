@@ -8,7 +8,9 @@ Wants=network-online.target
 Type=simple
 User=knowledge
 Group=knowledge
+WorkingDirectory=/home/knowledge
 Environment=HOME=/home/knowledge
+Environment=PATH=/home/knowledge/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=BASIC_MEMORY_DEFAULT_PROJECT=main
 Environment=BASIC_MEMORY_SYNC_CHANGES=true

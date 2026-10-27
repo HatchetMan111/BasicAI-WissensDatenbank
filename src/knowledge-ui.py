@@ -31,6 +31,16 @@ def container_ip():
         return "n/a"
 
 
+def semantic_mode():
+    try:
+        for line in Path("/etc/knowledge-semantic.conf").read_text().splitlines():
+            if line.startswith("SEMANTIC="):
+                return line.split("=", 1)[1].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
 def count_notes(data_dir):
     try:
         return sum(1 for _ in Path(data_dir).rglob("*.md"))
@@ -51,7 +61,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path in ("/health", "/status"):
-            self._send(200, json.dumps({"status": "ok", "app": "knowledge"}), "application/json")
+            self._send(
+                200,
+                json.dumps({"status": "ok", "app": "knowledge", "semantic": semantic_mode()}),
+                "application/json",
+            )
             return
         if self.path != "/":
             self._send(404, "not found", "text/plain")
@@ -62,6 +76,11 @@ class Handler(BaseHTTPRequestHandler):
         mcp_status = safe_run(["systemctl", "is-active", "knowledge-mcp"])
         ui_status = safe_run(["systemctl", "is-active", "knowledge-ui"])
         bm_version = safe_run([cfg["bm_bin"], "--version"])
+        semantics = semantic_mode()
+        semantic_label = {
+            "on": "aktiv (fastembed / lokale Embeddings)",
+            "off": "aus - Keyword-/FTS-Suche (CPU ohne AVX)",
+        }.get(semantics, "unbekannt")
         host = socket.gethostname()
         body = f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8">
@@ -79,7 +98,8 @@ code{{background:#f4f4f4;padding:.1rem .35rem;border-radius:6px}}</style>
 <b>Health:</b> <code>/health</code></div>
 <div class="card"><b>Daten dir:</b> <code>{html.escape(cfg['data_dir'])}</code><br>
 <b>Notizen (.md):</b> {notes}<br>
-<b>basic-memory:</b> <code>{html.escape(bm_version)}</code></div>
+<b>basic-memory:</b> <code>{html.escape(bm_version)}</code><br>
+<b>Semantische Suche:</b> {html.escape(semantic_label)}</div>
 <div class="card"><b>knowledge-mcp:</b> {html.escape(mcp_status)}<br>
 <b>knowledge-ui:</b> {html.escape(ui_status)}</div>
 <div class="card">Agenten-Config (remote MCP):<br>

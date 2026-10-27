@@ -210,6 +210,15 @@ msg_ok "Container-IP: $CT_IP"
 # ---------------------------------------------------------------------------
 # 4. basic-memory + Mini-UI im Container (via pct exec, idempotent)
 # ---------------------------------------------------------------------------
+# push: Datei via stdin in den Container (mktemp-Umweg, /dev/stdin ist unzuverlaessig)
+push_file() {
+  local dest="$1" tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  pct push "$CT_ID" "$tmp" "$dest"
+  rm -f "$tmp"
+}
+
 msg_info "Installiere basic-memory nativ via uv (idempotent) ..."
 pct exec "$CT_ID" -- bash -c '
   set -euo pipefail
@@ -220,52 +229,105 @@ pct exec "$CT_ID" -- bash -c '
   mkdir -p /opt/knowledge /var/lib/knowledge
   chown -R knowledge:knowledge /opt/knowledge /var/lib/knowledge
   if [ ! -x /home/knowledge/.local/bin/uv ]; then
-    su -s /bin/bash knowledge -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    su - knowledge -c "cd /home/knowledge && curl -LsSf https://astral.sh/uv/install.sh | sh"
   fi
-  su -s /bin/bash knowledge -c "export PATH=/home/knowledge/.local/bin:$PATH; uv tool install basic-memory --prerelease=allow"
+  su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv tool install basic-memory --prerelease=allow"
   ln -sf /home/knowledge/.local/bin/basic-memory /usr/local/bin/basic-memory
   /usr/local/bin/basic-memory --version
+  # onnxruntime-Wheels setzen AVX voraus. Fehlt AVX, killt "import fastembed" den
+  # MCP-Prozess hart mit SIGILL (systemd: status=4/ILL). Dann fastembed entfernen:
+  # basic-memory faellt dokumentiert auf Keyword-/FTS-Suche zurueck und bootet stabil.
+  if grep -qiE "^flags[[:space:]]*:.*[[:space:]]avx([[:space:]]|$)" /proc/cpuinfo; then
+    SEMANTIC=on
+  else
+    SEMANTIC=off
+    su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv pip uninstall --python /home/knowledge/.local/share/uv/tools/basic-memory/bin/python fastembed onnxruntime onnxruntime-extensions" || true
+    rm -rf /var/lib/knowledge/fastembed_cache /home/knowledge/.cache/fastembed
+  fi
+  printf "SEMANTIC=%s\n" "$SEMANTIC" > /etc/knowledge-semantic.conf
   chown -R knowledge:knowledge /var/lib/knowledge
 '
+
+SEMANTIC_MODE="$(pct exec "$CT_ID" -- sed -n 's/^SEMANTIC=//p' /etc/knowledge-semantic.conf 2>/dev/null | tr -d '\r' || true)"
+SEMANTIC_MODE="${SEMANTIC_MODE:-on}"
+if [[ "$SEMANTIC_MODE" == "off" ]]; then
+  msg_warn "CPU ohne AVX: onnxruntime (fastembed) wuerde den MCP-Server mit SIGILL beenden."
+  msg_warn "Semantische Suche ist deshalb AUS -> basic-memory nutzt Keyword-/FTS-Suche."
+  msg_warn "Upgrade-Pfad: Ollama/llama.cpp als OpenAI-kompatiblen Embedding-Server nutzen"
+  msg_warn "  und semantic_embedding_provider=litellm + semantic_embedding_api_base setzen."
+else
+  msg_ok "AVX vorhanden: semantische Suche (fastembed, lokale Embeddings) aktiv."
+fi
 
 msg_info "Lege Mini-UI nach /opt/knowledge ..."
 if pct exec "$CT_ID" -- curl -fsSL -o /opt/knowledge/knowledge-ui.py "$UI_PY_URL" 2>/dev/null; then
   msg_ok "knowledge-ui.py aus Repo uebernommen."
 else
   msg_warn "UI-URL nicht erreichbar – schreibe eingebettete UI (Fallback)."
-  pct push "$CT_ID" /dev/stdin /opt/knowledge/knowledge-ui.py <<UIEOF
+  push_file /opt/knowledge/knowledge-ui.py <<'UIEOF'
 #!/usr/bin/env python3
-import argparse, json, socket, subprocess
+import argparse
+import json
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
 def safe_run(cmd, timeout=5):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return (out.stdout.strip() + out.stderr.strip()).strip()[:2000]
-    except Exception as e:
-        return "n/a (%s)" % e
-class H(BaseHTTPRequestHandler):
+        return (out.stdout + out.stderr).strip()
+    except Exception as exc:  # noqa: BLE001
+        return "n/a (%s)" % exc
+
+
+def semantic_mode():
+    try:
+        for line in Path("/etc/knowledge-semantic.conf").read_text().splitlines():
+            if line.startswith("SEMANTIC="):
+                return line.split("=", 1)[1].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
+class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
-        d = body.encode("utf-8")
+        data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(d)))
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(d)
-    def do_GET(self):
-        if self.path in ("/health", "/status"):
+        self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/health":
             self._send(200, json.dumps({"status": "ok", "app": "knowledge"}), "application/json")
             return
-        notes = sum(1 for _ in Path("/var/lib/knowledge").rglob("*.md")) if True)
-        ip = safe_run(["hostname", "-I"]).split()[0] if safe_run(["hostname", "-I"]) else "n/a"
-        self._send(200, "<h1>Knowledge LXC</h1><p>MCP: http://%s:8000/sse</p><p>Notes: %s</p>" % (ip, notes), "text/html")
-    def log_message(self, *a):
+        if self.path != "/":
+            self._send(404, "not found", "text/plain")
+            return
+        notes = sum(1 for _ in Path("/var/lib/knowledge").rglob("*.md"))
+        ip = (safe_run(["hostname", "-I"]).split() or ["n/a"])[0]
+        body = (
+            "<h1>Knowledge LXC</h1>"
+            "<p>MCP: http://%s:8000/sse</p>"
+            "<p>Notizen: %d</p>"
+            "<p>Semantische Suche: %s</p>"
+        ) % (ip, notes, semantic_mode())
+        self._send(200, body, "text/html")
+
+    def log_message(self, *args):
         pass
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8080)
-    args, _ = ap.parse_known_args()
-    ThreadingHTTPServer(("0.0.0.0", args.port), H).serve_forever()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8080)
+    args, _ = parser.parse_known_args()
+    ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+
+
 if __name__ == "__main__":
     main()
 UIEOF
@@ -277,7 +339,7 @@ if pct exec "$CT_ID" -- curl -fsSL -o /etc/systemd/system/knowledge-mcp.service 
   msg_ok "knowledge-mcp.service aus Repo uebernommen."
 else
   msg_warn "MCP-Service-URL nicht erreichbar – schreibe Inline-Unit."
-  pct push "$CT_ID" /dev/stdin /etc/systemd/system/knowledge-mcp.service <<UNIT
+  push_file /etc/systemd/system/knowledge-mcp.service <<'UNIT'
 [Unit]
 Description=Knowledge LXC - basic-memory MCP SSE (:8000)
 After=network-online.target
@@ -286,7 +348,9 @@ Wants=network-online.target
 Type=simple
 User=knowledge
 Group=knowledge
+WorkingDirectory=/home/knowledge
 Environment=HOME=/home/knowledge
+Environment=PATH=/home/knowledge/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=BASIC_MEMORY_DEFAULT_PROJECT=main
 Environment=BASIC_MEMORY_SYNC_CHANGES=true
@@ -301,7 +365,7 @@ if pct exec "$CT_ID" -- curl -fsSL -o /etc/systemd/system/knowledge-ui.service "
   msg_ok "knowledge-ui.service aus Repo uebernommen."
 else
   msg_warn "UI-Service-URL nicht erreichbar – schreibe Inline-Unit."
-  pct push "$CT_ID" /dev/stdin /etc/systemd/system/knowledge-ui.service <<UNIT
+  push_file /etc/systemd/system/knowledge-ui.service <<'UNIT'
 [Unit]
 Description=Knowledge LXC - Mini Status-UI (:8080)
 After=network-online.target knowledge-mcp.service
@@ -310,6 +374,8 @@ Wants=network-online.target
 Type=simple
 User=knowledge
 Group=knowledge
+WorkingDirectory=/home/knowledge
+Environment=HOME=/home/knowledge
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/knowledge/knowledge-ui.py --port 8080 --mcp-port 8000 --data-dir /var/lib/knowledge --bm-bin /usr/local/bin/basic-memory --bind 0.0.0.0
 Restart=always
@@ -319,19 +385,78 @@ WantedBy=multi-user.target
 UNIT
 fi
 pct exec "$CT_ID" -- systemctl daemon-reload
-pct exec "$CT_ID" -- systemctl enable --now knowledge-mcp
-pct exec "$CT_ID" -- systemctl enable --now knowledge-ui
+pct exec "$CT_ID" -- systemctl enable knowledge-mcp knowledge-ui
 
-msg_info "Initialisiere main-Projekt ..."
-pct exec "$CT_ID" -- su -s /bin/bash knowledge -c "/usr/local/bin/basic-memory project list | grep -q main || /usr/local/bin/basic-memory project add main /var/lib/knowledge" || msg_warn "Projekt-Init uebersprungen (wird beim ersten Start angelegt)."
+msg_info "Initialisiere main-Projekt (Login-Shell: HOME=/home/knowledge, sonst EACCES auf .env/pyproject.toml) ..."
+if ! pct exec "$CT_ID" -- bash -c '
+  set -e
+  LIST="$(su - knowledge -c "cd /home/knowledge && /usr/local/bin/basic-memory project list 2>&1")"
+  printf "%s\n" "$LIST"
+  if printf "%s" "$LIST" | grep -q "/var/lib/knowledge"; then
+    echo "Projekt mit Pfad /var/lib/knowledge existiert bereits."
+  elif printf "%s" "$LIST" | grep -qw main; then
+    echo "WARN: Projekt main existiert bereits mit anderem Pfad – bitte manuell pruefen."
+  else
+    su - knowledge -c "cd /home/knowledge && /usr/local/bin/basic-memory project add main /var/lib/knowledge"
+  fi
+'; then
+  msg_error "Projekt-Init fehlgeschlagen (vollstaendige Ausgabe oben)."
+  exit 1
+fi
+msg_ok "Projekt main -> /var/lib/knowledge bereit."
 
 # ---------------------------------------------------------------------------
-# 5. Verifikation: Service + Web UI + MCP-Port
+# 5. Verifikation: Service stabil + Web UI + MCP-Port
 # ---------------------------------------------------------------------------
-msg_info "Verifiziere Installation ..."
-pct exec "$CT_ID" -- systemctl is-active knowledge-mcp || { msg_error "systemd-Service knowledge-mcp ist nicht active."; pct exec "$CT_ID" -- systemctl status knowledge-mcp --no-pager || true; pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 100 || true; exit 1; }
-msg_ok "Service knowledge-mcp laeuft."
-pct exec "$CT_ID" -- systemctl is-active knowledge-ui || { msg_error "systemd-Service knowledge-ui ist nicht active."; pct exec "$CT_ID" -- systemctl status knowledge-ui --no-pager || true; exit 1; }
+mcp_active() { pct exec "$CT_ID" -- systemctl is-active --quiet knowledge-mcp 2>/dev/null; }
+
+wait_mcp_stable() {
+  local i restarts
+  for i in $(seq 1 15); do
+    mcp_active || return 1
+    sleep 2
+  done
+  restarts="$(pct exec "$CT_ID" -- systemctl show -p NRestarts --value knowledge-mcp 2>/dev/null | tr -d '\r' || true)"
+  (( ${restarts:-0} <= ${MCP_RESTARTS_BASE:-0} ))
+}
+
+msg_info "Starte knowledge-mcp (Stabilitaetsfenster 30s – SIGILL tritt ~20s nach Start auf) ..."
+pct exec "$CT_ID" -- systemctl reset-failed knowledge-mcp 2>/dev/null || true
+MCP_RESTARTS_BASE="$(pct exec "$CT_ID" -- systemctl show -p NRestarts --value knowledge-mcp 2>/dev/null | tr -d '\r' || true)"
+MCP_RESTARTS_BASE="${MCP_RESTARTS_BASE:-0}"
+pct exec "$CT_ID" -- systemctl restart knowledge-mcp
+
+if ! wait_mcp_stable; then
+  msg_error "knowledge-mcp ist nicht stabil aktiv. Status + letzte 120 Journal-Zeilen:"
+  pct exec "$CT_ID" -- systemctl status knowledge-mcp --no-pager || true
+  pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 120 || true
+  if [[ "$SEMANTIC_MODE" == "on" ]]; then
+    msg_warn "Fallback: entferne fastembed/onnxruntime (semantische Suche aus) und starte neu ..."
+    pct exec "$CT_ID" -- bash -c '
+      su - knowledge -c "cd /home/knowledge && export PATH=/home/knowledge/.local/bin:$PATH && uv pip uninstall --python /home/knowledge/.local/share/uv/tools/basic-memory/bin/python fastembed onnxruntime onnxruntime-extensions" || true
+      printf "SEMANTIC=off\n" > /etc/knowledge-semantic.conf
+      rm -rf /var/lib/knowledge/fastembed_cache /home/knowledge/.cache/fastembed
+    ' || true
+    SEMANTIC_MODE=off
+    pct exec "$CT_ID" -- systemctl reset-failed knowledge-mcp 2>/dev/null || true
+    pct exec "$CT_ID" -- systemctl restart knowledge-mcp 2>/dev/null || pct exec "$CT_ID" -- systemctl start knowledge-mcp
+    if wait_mcp_stable; then
+      msg_warn "MCP laeuft jetzt im Keyword-/FTS-Modus (semantische Suche aus)."
+      msg_warn "Ursache oben im Journal pruefen (typisch: onnxruntime/SIGILL ohne AVX)."
+    else
+      msg_error "MCP startet auch ohne fastembed nicht. Vollstaendiges Journal:"
+      pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 200 || true
+      pct exec "$CT_ID" -- systemctl status knowledge-mcp --no-pager || true
+      exit 1
+    fi
+  else
+    exit 1
+  fi
+fi
+msg_ok "knowledge-mcp laeuft stabil (30s ohne Neustart)."
+
+pct exec "$CT_ID" -- systemctl start knowledge-ui
+pct exec "$CT_ID" -- systemctl is-active knowledge-ui || { msg_error "systemd-Service knowledge-ui ist nicht active."; pct exec "$CT_ID" -- systemctl status knowledge-ui --no-pager || true; pct exec "$CT_ID" -- journalctl -u knowledge-ui --no-pager -n 80 || true; exit 1; }
 msg_ok "Service knowledge-ui laeuft."
 
 msg_info "Warte auf Web UI (max. 3 Min) ..."
@@ -348,11 +473,10 @@ msg_info "Pruefe MCP-Port ${MCP_PORT} ..."
 MCP_OK=0
 for _ in $(seq 1 18); do
   if pct exec "$CT_ID" -- bash -c "command -v ss >/dev/null && ss -tln | grep -q :${MCP_PORT}" >/dev/null 2>&1; then MCP_OK=1; break; fi
-  if pct exec "$CT_ID" -- curl -fs -m 5 "http://localhost:${MCP_PORT}/" >/dev/null 2>&1; then MCP_OK=1; break; fi
-  sleep 10
+  sleep 5
 done
 [[ "$MCP_OK" == "1" ]] \
-  || { msg_error "MCP antwortet nicht auf Port ${MCP_PORT}."; pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 100 || true; exit 1; }
+  || { msg_error "MCP lauscht nicht auf Port ${MCP_PORT}."; pct exec "$CT_ID" -- journalctl -u knowledge-mcp --no-pager -n 120 || true; exit 1; }
 msg_ok "MCP-Port ${MCP_PORT} offen."
 
 echo ""
